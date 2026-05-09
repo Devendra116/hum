@@ -1,7 +1,6 @@
 use crate::player::Player;
 use crate::queue::Queue;
-use crate::types::{AppMode, PlaybackState, PlayerStatus, Track};
-use crate::youtube;
+use crate::types::{AppMode, PlaybackState, PlayerStatus, QueueAction, Track};
 use anyhow::Result;
 
 pub struct App {
@@ -14,6 +13,7 @@ pub struct App {
     pub message: String,
     pub should_quit: bool,
     pub loading: bool,
+    pub spinner_tick: u8,
 }
 
 impl App {
@@ -29,130 +29,21 @@ impl App {
             message: String::from("Welcome to hum. Press '/' to search, 'q' to quit."),
             should_quit: false,
             loading: false,
+            spinner_tick: 0,
         })
     }
 
-    pub async fn play_query(&mut self, query: &str) {
-        self.loading = true;
-        self.message = format!("Searching: {query}...");
-
-        match youtube::search(query, 3).await {
-            Ok(results) if results.is_empty() => {
-                self.message = "No results found.".to_string();
-                self.loading = false;
-            }
-            Ok(results) => {
-                if results.len() == 1 || self.is_clear_match(&results) {
-                    self.play_track(results[0].clone()).await;
-                } else {
-                    self.choices = results;
-                    self.mode = AppMode::Choosing;
-                    self.message = "Multiple matches — press 1, 2, or 3 to pick:".to_string();
-                }
-                self.loading = false;
-            }
-            Err(e) => {
-                self.message = format!("Search error: {e}");
-                self.loading = false;
-            }
-        }
-    }
-
-    fn is_clear_match(&self, results: &[Track]) -> bool {
-        if results.len() < 2 {
-            return true;
-        }
-        let first = &results[0].title.to_lowercase();
-        let query = self.search_input.to_lowercase();
-        first.contains(&query) || query.contains(first.split(" - ").next().unwrap_or(""))
-    }
-
-    pub async fn play_track(&mut self, track: Track) {
-        self.message = format!("Loading: {} — {}", track.title, track.channel);
-        self.status.state = PlaybackState::Loading;
-
-        let video_id = track.id.clone();
-        self.queue.add(track);
-        let idx = self.queue.len() - 1;
-        self.queue.set_current(idx);
-
-        match youtube::get_audio_url(&video_id).await {
-            Ok(url) => {
-                if let Err(e) = self.player.play_url(&url).await {
-                    self.message = format!("Playback error: {e}");
-                    return;
-                }
-                if let Some(t) = self.queue.current() {
-                    self.message = format!("Playing: {} — {}", t.title, t.channel);
-                }
-            }
-            Err(e) => {
-                self.message = format!("Failed to get audio URL: {e}");
-            }
-        }
-    }
-
-    pub async fn play_current(&mut self) {
-        if let Some(track) = self.queue.current().cloned() {
-            let video_id = track.id.clone();
-            self.message = format!("Loading: {} — {}", track.title, track.channel);
-            self.status.state = PlaybackState::Loading;
-
-            match youtube::get_audio_url(&video_id).await {
-                Ok(url) => {
-                    if let Err(e) = self.player.play_url(&url).await {
-                        self.message = format!("Playback error: {e}");
-                        return;
-                    }
-                    self.message = format!("Playing: {} — {}", track.title, track.channel);
-                }
-                Err(e) => {
-                    self.message = format!("Failed to get audio URL: {e}");
-                }
-            }
-        }
-    }
-
-    pub async fn next_track(&mut self) {
-        if self.queue.next().is_some() {
-            self.play_current().await;
-        } else if self.queue.radio_mode {
-            self.load_radio().await;
-        } else {
-            self.message = "Queue ended.".to_string();
-            self.status.state = PlaybackState::Stopped;
-        }
-    }
-
-    pub async fn prev_track(&mut self) {
+    /// Retreat the queue by one and return what background work is needed.
+    pub fn retreat_queue(&mut self) -> QueueAction {
         if self.queue.prev().is_some() {
-            self.play_current().await;
-        }
-    }
-
-    pub async fn load_radio(&mut self) {
-        if let Some(track) = self.queue.current().cloned() {
-            self.message = "Loading radio recommendations...".to_string();
-            match youtube::fetch_mix_playlist(&track.id).await {
-                Ok(tracks) if !tracks.is_empty() => {
-                    self.queue.add_many(tracks);
-                    self.queue.next();
-                    self.play_current().await;
-                }
-                _ => {
-                    self.message = "Radio: couldn't find related tracks.".to_string();
-                }
+            if let Some(track) = self.queue.current().cloned() {
+                self.loading = true;
+                self.status.state = PlaybackState::Loading;
+                self.message = format!("Loading: {} — {}", track.title, track.channel);
+                return QueueAction::FetchUrl(track);
             }
         }
-    }
-
-    pub async fn handle_choice(&mut self, choice: usize) {
-        if choice < self.choices.len() {
-            let track = self.choices[choice].clone();
-            self.choices.clear();
-            self.mode = AppMode::Normal;
-            self.play_track(track).await;
-        }
+        QueueAction::None
     }
 
     pub async fn toggle_pause(&mut self) {
@@ -181,15 +72,6 @@ impl App {
         self.status = self.player.get_status().await;
     }
 
-    pub async fn check_track_ended(&mut self) {
-        if self.status.state == PlaybackState::Stopped
-            && self.queue.current().is_some()
-            && self.status.duration > 0.0
-        {
-            self.next_track().await;
-        }
-    }
-
     pub fn toggle_radio(&mut self) {
         self.queue.radio_mode = !self.queue.radio_mode;
         let state = if self.queue.radio_mode { "ON" } else { "OFF" };
@@ -203,5 +85,47 @@ impl App {
 
     pub async fn shutdown(&mut self) {
         self.player.shutdown().await;
+    }
+
+    /// Tick the spinner animation counter — called every event-loop iteration.
+    pub fn tick_spinner(&mut self) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+    }
+
+    /// Queue a track and start playback from a pre-fetched URL (fast — no network I/O).
+    pub async fn start_playing(&mut self, track: Track, url: &str) {
+        self.queue.add(track.clone());
+        let idx = self.queue.len() - 1;
+        self.queue.set_current(idx);
+        match self.player.play_url(url).await {
+            Ok(()) => self.message = format!("Playing: {} — {}", track.title, track.channel),
+            Err(e) => self.message = format!("Playback error: {e}"),
+        }
+    }
+
+    /// Advance the queue and return what background work is needed next.
+    /// Never does network I/O — the caller owns the spawn.
+    pub fn advance_queue(&mut self) -> QueueAction {
+        if self.queue.next().is_some() {
+            if let Some(track) = self.queue.current().cloned() {
+                self.loading = true;
+                self.status.state = PlaybackState::Loading;
+                self.message = format!("Loading: {} — {}", track.title, track.channel);
+                return QueueAction::FetchUrl(track);
+            }
+        }
+        if self.queue.radio_mode {
+            if let Some(track) = self.queue.current().cloned() {
+                self.loading = true;
+                self.message = "Loading radio recommendations...".to_string();
+                return QueueAction::FetchRadio {
+                    title: track.title.clone(),
+                    channel: track.channel.clone(),
+                };
+            }
+        }
+        self.message = "Queue ended.".to_string();
+        self.status.state = PlaybackState::Stopped;
+        QueueAction::None
     }
 }

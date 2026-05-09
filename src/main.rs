@@ -8,14 +8,17 @@ mod youtube;
 use anyhow::Result;
 use app::App;
 use clap::Parser;
+use rand::seq::SliceRandom;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use std::collections::HashSet;
 use std::io::stdout;
 use std::time::Duration;
-use types::AppMode;
+use tokio::sync::mpsc;
+use types::{AppMode, PlaybackState, QueueAction, Track};
 
 #[derive(Parser)]
 #[command(name = "hum", version, about = "A minimal, ad-free terminal music player")]
@@ -26,6 +29,21 @@ struct Cli {
     /// Start with radio mode enabled (auto-play related songs)
     #[arg(long)]
     radio: bool,
+}
+
+/// Results sent back to the main loop from background tasks.
+enum BgResult {
+    SearchDone {
+        query: String,
+        result: anyhow::Result<Vec<Track>>,
+    },
+    UrlFetched {
+        track: Track,
+        result: anyhow::Result<String>,
+    },
+    RadioFetched {
+        result: anyhow::Result<Vec<Track>>,
+    },
 }
 
 #[tokio::main]
@@ -46,12 +64,14 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    let (bg_tx, bg_rx) = mpsc::channel::<BgResult>(16);
+
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        app.play_query(&query).await;
+        spawn_search(query, bg_tx.clone(), &mut app);
     }
 
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = run_loop(&mut terminal, &mut app, bg_tx, bg_rx).await;
 
     app.shutdown().await;
     terminal::disable_raw_mode()?;
@@ -63,26 +83,40 @@ async fn main() -> Result<()> {
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
+    bg_tx: mpsc::Sender<BgResult>,
+    mut bg_rx: mpsc::Receiver<BgResult>,
 ) -> Result<()> {
     loop {
+        app.tick_spinner();
         terminal.draw(|f| ui::draw(f, app))?;
 
-        if event::poll(Duration::from_millis(200))? {
+        // Drain all ready background results without blocking.
+        while let Ok(msg) = bg_rx.try_recv() {
+            handle_bg_result(app, msg, &bg_tx).await;
+        }
+
+        // Short poll so the spinner animates smoothly even during loads.
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('c')
+                {
                     app.should_quit = true;
                 }
 
                 match app.mode {
-                    AppMode::Search => handle_search_input(app, key.code).await,
-                    AppMode::Choosing => handle_choice_input(app, key.code).await,
-                    AppMode::Normal => handle_normal_input(app, key.code).await,
+                    AppMode::Search => handle_search_input(app, key.code, &bg_tx),
+                    AppMode::Choosing => handle_choice_input(app, key.code, &bg_tx).await,
+                    AppMode::Normal => handle_normal_input(app, key.code, &bg_tx).await,
                 }
             }
         }
 
+        let prev_state = app.status.state;
+        let prev_pos = app.status.position;
+        let prev_dur = app.status.duration;
         app.update_status().await;
-        app.check_track_ended().await;
+        check_track_ended(app, &bg_tx, prev_state, prev_pos, prev_dur).await;
 
         if app.should_quit {
             break;
@@ -91,27 +125,156 @@ async fn run_loop(
     Ok(())
 }
 
-async fn handle_normal_input(app: &mut App, key: KeyCode) {
-    match key {
-        KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('/') => {
-            app.mode = AppMode::Search;
-            app.search_input.clear();
+// ---------------------------------------------------------------------------
+// Background result handler
+// ---------------------------------------------------------------------------
+
+async fn handle_bg_result(app: &mut App, msg: BgResult, bg_tx: &mpsc::Sender<BgResult>) {
+    match msg {
+        BgResult::SearchDone { query, result } => {
+            app.loading = false;
+            match result {
+                Err(e) => app.message = format!("Search error: {e}"),
+                Ok(tracks) if tracks.is_empty() => {
+                    app.message = "No results found.".to_string();
+                }
+                Ok(tracks) => {
+                    if tracks.len() == 1 || is_clear_match(&tracks, &query) {
+                        spawn_url_fetch(tracks[0].clone(), bg_tx.clone(), app);
+                    } else {
+                        app.choices = tracks;
+                        app.mode = AppMode::Choosing;
+                        app.message =
+                            "Multiple matches — press 1, 2, or 3 to pick:".to_string();
+                    }
+                }
+            }
         }
-        KeyCode::Char(' ') => app.toggle_pause().await,
-        KeyCode::Char('n') => app.next_track().await,
-        KeyCode::Char('p') => app.prev_track().await,
-        KeyCode::Char('s') => app.shuffle_queue(),
-        KeyCode::Char('r') => app.toggle_radio(),
-        KeyCode::Char('+') | KeyCode::Char('=') => app.volume_up().await,
-        KeyCode::Char('-') => app.volume_down().await,
-        KeyCode::Right => app.seek_forward().await,
-        KeyCode::Left => app.seek_backward().await,
-        _ => {}
+
+        BgResult::UrlFetched { track, result } => {
+            app.loading = false;
+            match result {
+                Ok(url) => app.start_playing(track, &url).await,
+                Err(e) => app.message = format!("Failed to get audio URL: {e}"),
+            }
+        }
+
+        BgResult::RadioFetched { result } => {
+            app.loading = false;
+            match result {
+                Ok(tracks) if !tracks.is_empty() => {
+                    let in_queue: HashSet<_> =
+                        app.queue.tracks().iter().map(|t| t.id.as_str()).collect();
+                    let mut fresh: Vec<Track> = tracks
+                        .into_iter()
+                        .filter(|t| !in_queue.contains(t.id.as_str()))
+                        .collect();
+                    fresh.shuffle(&mut rand::thread_rng());
+                    fresh.truncate(5);
+                    if fresh.is_empty() {
+                        app.message =
+                            "Radio: search only returned songs already in queue.".to_string();
+                    } else {
+                        app.queue.add_many(fresh);
+                        let action = app.advance_queue();
+                        dispatch_action(app, action, bg_tx);
+                    }
+                }
+                _ => app.message = "Radio: couldn't find related tracks.".to_string(),
+            }
+        }
     }
 }
 
-async fn handle_search_input(app: &mut App, key: KeyCode) {
+// ---------------------------------------------------------------------------
+// Spawn helpers
+// ---------------------------------------------------------------------------
+
+fn spawn_search(query: String, tx: mpsc::Sender<BgResult>, app: &mut App) {
+    app.loading = true;
+    app.message = format!("Searching: {query}...");
+    tokio::spawn(async move {
+        let result = youtube::search(&query, 3).await;
+        let _ = tx.send(BgResult::SearchDone { query, result }).await;
+    });
+}
+
+fn spawn_url_fetch(track: Track, tx: mpsc::Sender<BgResult>, app: &mut App) {
+    app.loading = true;
+    app.status.state = PlaybackState::Loading;
+    app.message = format!("Loading: {} — {}", track.title, track.channel);
+    let video_id = track.id.clone();
+    tokio::spawn(async move {
+        let result = youtube::get_audio_url(&video_id).await;
+        let _ = tx.send(BgResult::UrlFetched { track, result }).await;
+    });
+}
+
+fn spawn_radio_fetch(title: String, channel: String, tx: mpsc::Sender<BgResult>, app: &mut App) {
+    app.loading = true;
+    app.message = "Loading radio recommendations...".to_string();
+    tokio::spawn(async move {
+        let result = youtube::fetch_radio_tracks(&title, &channel).await;
+        let _ = tx.send(BgResult::RadioFetched { result }).await;
+    });
+}
+
+fn dispatch_action(app: &mut App, action: QueueAction, bg_tx: &mpsc::Sender<BgResult>) {
+    match action {
+        QueueAction::FetchUrl(track) => spawn_url_fetch(track, bg_tx.clone(), app),
+        QueueAction::FetchRadio { title, channel } => {
+            spawn_radio_fetch(title, channel, bg_tx.clone(), app)
+        }
+        QueueAction::None => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Track-end auto-advance
+// ---------------------------------------------------------------------------
+
+/// True if the previous sample looked like natural EOF (not a mid-track gap).
+fn playback_had_reached_end(prev_pos: f64, prev_dur: f64) -> bool {
+    if prev_dur <= 0.0 {
+        return false;
+    }
+    let slack = if prev_dur < 3.0 {
+        (prev_dur * 0.08).max(0.12)
+    } else {
+        1.5_f64
+    };
+    prev_pos >= prev_dur - slack
+}
+
+async fn check_track_ended(
+    app: &mut App,
+    bg_tx: &mpsc::Sender<BgResult>,
+    prev_state: PlaybackState,
+    prev_pos: f64,
+    prev_dur: f64,
+) {
+    if app.loading {
+        return;
+    }
+    // mpv sets idle-active (Stopped) when a file ends, but duration/time-pos
+    // often reset to 0 in that state — so we must use the *previous* tick's
+    // position/duration and a Playing→Stopped transition instead of
+    // `duration > 0` on the current status.
+    if prev_state == PlaybackState::Playing
+        && app.status.state == PlaybackState::Stopped
+        && app.queue.current().is_some()
+        && playback_had_reached_end(prev_pos, prev_dur)
+    {
+        let action = app.advance_queue();
+        dispatch_action(app, action, bg_tx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input handlers (no blocking network calls)
+// ---------------------------------------------------------------------------
+
+fn handle_search_input(app: &mut App, key: KeyCode, bg_tx: &mpsc::Sender<BgResult>) {
     match key {
         KeyCode::Esc => {
             app.mode = AppMode::Normal;
@@ -120,8 +283,9 @@ async fn handle_search_input(app: &mut App, key: KeyCode) {
         KeyCode::Enter => {
             let query = app.search_input.clone();
             app.mode = AppMode::Normal;
+            app.search_input.clear();
             if !query.is_empty() {
-                app.play_query(&query).await;
+                spawn_search(query, bg_tx.clone(), app);
             }
         }
         KeyCode::Backspace => {
@@ -134,18 +298,74 @@ async fn handle_search_input(app: &mut App, key: KeyCode) {
     }
 }
 
-async fn handle_choice_input(app: &mut App, key: KeyCode) {
-    match key {
-        KeyCode::Char('1') => app.handle_choice(0).await,
-        KeyCode::Char('2') => app.handle_choice(1).await,
-        KeyCode::Char('3') => app.handle_choice(2).await,
+async fn handle_choice_input(
+    app: &mut App,
+    key: KeyCode,
+    bg_tx: &mpsc::Sender<BgResult>,
+) {
+    let pick = match key {
+        KeyCode::Char('1') => Some(0),
+        KeyCode::Char('2') => Some(1),
+        KeyCode::Char('3') => Some(2),
         KeyCode::Esc => {
             app.mode = AppMode::Normal;
             app.choices.clear();
             app.message = "Cancelled.".to_string();
+            return;
         }
+        _ => return,
+    };
+    if let Some(idx) = pick {
+        if idx < app.choices.len() {
+            let track = app.choices[idx].clone();
+            app.choices.clear();
+            app.mode = AppMode::Normal;
+            spawn_url_fetch(track, bg_tx.clone(), app);
+        }
+    }
+}
+
+async fn handle_normal_input(
+    app: &mut App,
+    key: KeyCode,
+    bg_tx: &mpsc::Sender<BgResult>,
+) {
+    match key {
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('/') => {
+            app.mode = AppMode::Search;
+            app.search_input.clear();
+        }
+        KeyCode::Char(' ') => app.toggle_pause().await,
+        KeyCode::Char('n') => {
+            let action = app.advance_queue();
+            dispatch_action(app, action, bg_tx);
+        }
+        KeyCode::Char('p') => {
+            let action = app.retreat_queue();
+            dispatch_action(app, action, bg_tx);
+        }
+        KeyCode::Char('s') => app.shuffle_queue(),
+        KeyCode::Char('r') => app.toggle_radio(),
+        KeyCode::Char('+') | KeyCode::Char('=') => app.volume_up().await,
+        KeyCode::Char('-') => app.volume_down().await,
+        KeyCode::Right => app.seek_forward().await,
+        KeyCode::Left => app.seek_backward().await,
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn is_clear_match(results: &[Track], query: &str) -> bool {
+    if results.len() < 2 {
+        return true;
+    }
+    let first = results[0].title.to_lowercase();
+    let q = query.to_lowercase();
+    first.contains(&q) || q.contains(first.split(" - ").next().unwrap_or(""))
 }
 
 fn check_dependencies() -> Result<()> {
@@ -154,16 +374,20 @@ fn check_dependencies() -> Result<()> {
     Command::new("yt-dlp")
         .arg("--version")
         .output()
-        .map_err(|_| anyhow::anyhow!(
-            "yt-dlp not found. Install it:\n  pip install yt-dlp\n  or: sudo apt install yt-dlp"
-        ))?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "yt-dlp not found. Install it:\n  pip install yt-dlp\n  or: sudo apt install yt-dlp"
+            )
+        })?;
 
     Command::new("mpv")
         .arg("--version")
         .output()
-        .map_err(|_| anyhow::anyhow!(
-            "mpv not found. Install it:\n  sudo apt install mpv\n  or: brew install mpv"
-        ))?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "mpv not found. Install it:\n  sudo apt install mpv\n  or: brew install mpv"
+            )
+        })?;
 
     Ok(())
 }

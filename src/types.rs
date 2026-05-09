@@ -23,7 +23,7 @@ impl Track {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackState {
     Stopped,
     Playing,
@@ -55,4 +55,13 @@ pub enum AppMode {
     Normal,
     Search,
     Choosing,
+}
+
+/// Action returned by queue-advance logic — tells the main loop what background
+/// work (if any) needs to be kicked off next.
+#[derive(Debug)]
+pub enum QueueAction {
+    FetchUrl(Track),
+    FetchRadio { title: String, channel: String },
+    None,
 }

@@ -24,14 +24,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_input(frame, app, chunks[3]);
 }
 
+fn spinner_char(tick: u8) -> char {
+    ['◐', '◓', '◑', '◒'][(tick / 4) as usize % 4]
+}
+
 fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect) {
     let (title, info) = match app.queue.current() {
         Some(track) => {
-            let state_icon = match app.status.state {
-                PlaybackState::Playing => "▶",
-                PlaybackState::Paused => "⏸",
-                PlaybackState::Loading => "◌",
-                PlaybackState::Stopped => "■",
+            let state_icon = if app.loading {
+                spinner_char(app.spinner_tick).to_string()
+            } else {
+                match app.status.state {
+                    PlaybackState::Playing => "▶".to_string(),
+                    PlaybackState::Paused => "⏸".to_string(),
+                    PlaybackState::Loading => "◌".to_string(),
+                    PlaybackState::Stopped => "■".to_string(),
+                }
             };
             let radio = if app.queue.radio_mode { " [RADIO]" } else { "" };
             (
@@ -39,10 +47,17 @@ fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect) {
                 format!(" {} • Vol: {}%{radio} ", track.channel, app.status.volume),
             )
         }
-        None => (
-            " hum — terminal music player ".to_string(),
-            " No track loaded ".to_string(),
-        ),
+        None => {
+            let idle_icon = if app.loading {
+                spinner_char(app.spinner_tick).to_string()
+            } else {
+                "♪".to_string()
+            };
+            (
+                format!(" {idle_icon} hum — terminal music player "),
+                " No track loaded ".to_string(),
+            )
+        }
     };
 
     let block = Block::default()
@@ -77,10 +92,46 @@ fn draw_progress(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_main_area(frame: &mut Frame, app: &App, area: Rect) {
-    match app.mode {
-        AppMode::Choosing => draw_choices(frame, app, area),
-        _ => draw_queue(frame, app, area),
+    if app.loading {
+        draw_loading(frame, app, area);
+    } else {
+        match app.mode {
+            AppMode::Choosing => draw_choices(frame, app, area),
+            _ => draw_queue(frame, app, area),
+        }
     }
+}
+
+fn draw_loading(frame: &mut Frame, app: &App, area: Rect) {
+    let spinner = spinner_char(app.spinner_tick);
+    let dots = match (app.spinner_tick / 8) % 4 {
+        0 => "   ",
+        1 => ".  ",
+        2 => ".. ",
+        _ => "...",
+    };
+    let label = Line::from(vec![
+        Span::styled(
+            format!(" {spinner} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}{}", app.message.trim_end_matches('.'), dots),
+            Style::default().fg(Color::White),
+        ),
+    ]);
+
+    let para = Paragraph::new(label)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Loading "),
+        );
+
+    frame.render_widget(para, area);
 }
 
 fn draw_choices(frame: &mut Frame, app: &App, area: Rect) {
