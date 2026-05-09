@@ -2,11 +2,7 @@
 
 A minimal, ad-free terminal music player. No API keys. No subscriptions. No accounts. Just music.
 
-## Demo
 
-> Add your recording at `docs/demo.gif` (or update the path below) so the README shows a real run.
-
-hum demo
 
 ### Terminal UI Preview
 
@@ -39,31 +35,45 @@ $ hum Big Dawgs
 
 ## Install
 
-### Prerequisites
+### Quick install (recommended)
+
+**macOS / Linux:**
 
 ```bash
-# Install yt-dlp (YouTube audio extraction)
-pip install yt-dlp
-
-# Install mpv (audio playback)
-sudo apt install mpv        # Debian/Ubuntu
-# or
-brew install mpv            # macOS
-# or
-sudo pacman -S mpv          # Arch
+curl -fsSL https://raw.githubusercontent.com/Devendra116/hum/main/install.sh | sh
 ```
 
-### Install hum
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/Devendra116/hum/main/install.ps1 | iex
+```
+
+The installer handles everything — downloads prebuilt binaries for **hum** and **yt-dlp**, verifies SHA-256 checksums, and installs **mpv** via your system package manager. No Rust or Python required.
+
+To install a specific version:
 
 ```bash
-# From source
+curl -fsSL https://raw.githubusercontent.com/Devendra116/hum/main/install.sh | HUM_VERSION=v0.1.0 sh
+```
+
+Running the same command again will upgrade to the latest version.
+
+> **Security:** all downloads are over HTTPS from official GitHub repos only, with SHA-256 checksum verification. Binaries install to `~/.local/bin` (no root). You can [inspect the script](install.sh) before running it.
+
+### Other install methods
+
+```bash
+# From source (requires Rust toolchain)
 git clone https://github.com/Devendra116/hum.git
 cd hum
 cargo install --path .
 
-# Or directly from crates.io (once published)
-# cargo install hum
+# From crates.io (once published)
+cargo install hum
 ```
+
+You can also download binaries directly from [GitHub Releases](https://github.com/Devendra116/hum/releases).
 
 ## Usage
 
