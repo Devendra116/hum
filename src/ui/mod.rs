@@ -97,6 +97,7 @@ fn draw_main_area(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.mode {
             AppMode::Choosing => draw_choices(frame, app, area),
+            AppMode::ChoosingPlaylist => draw_playlist_choices(frame, app, area),
             _ => draw_queue(frame, app, area),
         }
     }
@@ -166,17 +167,67 @@ fn draw_choices(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+fn draw_playlist_choices(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .playlist_choices
+        .iter()
+        .enumerate()
+        .map(|(i, pl)| {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {} ", i + 1),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(&pl.title, Style::default().fg(Color::White)),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Pick a playlist (1–5) "),
+        );
+
+    frame.render_widget(list, area);
+}
+
 fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
     let current_idx = app.queue.current_index();
+    let selected_idx = app.queue_cursor.or(current_idx);
+    let total = app.queue.len();
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let start = if visible_rows == 0 || total <= visible_rows {
+        0
+    } else {
+        let s = selected_idx.unwrap_or(0).saturating_sub(visible_rows / 2);
+        s.min(total - visible_rows)
+    };
+    let end = if visible_rows == 0 {
+        total
+    } else {
+        (start + visible_rows).min(total)
+    };
     let items: Vec<ListItem> = app
         .queue
         .tracks()
         .iter()
         .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
         .map(|(i, track)| {
             let is_current = current_idx == Some(i);
-            let prefix = if is_current { "▶ " } else { "  " };
-            let style = if is_current {
+            let is_selected = selected_idx == Some(i);
+            let prefix = match (is_current, is_selected) {
+                (true, true) => "▶➤ ",
+                (true, false) => "▶  ",
+                (false, true) => " ➤ ",
+                (false, false) => "   ",
+            };
+            let style = if is_current || is_selected {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -219,9 +270,10 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let help = match app.mode {
-        AppMode::Search => " Enter: play | Esc: cancel ",
+        AppMode::Search => " Enter: song / playlist URL / pl:keywords | Esc: cancel ",
         AppMode::Choosing => " 1/2/3: pick | Esc: cancel ",
-        AppMode::Normal => " /: search | space: pause | n/p: next/prev | r: radio | q: quit ",
+        AppMode::ChoosingPlaylist => " 1–5: pick playlist | Esc: cancel ",
+        AppMode::Normal => " /: search | ↑/↓: select | Enter: play selected | n/p: next/prev | r: radio | q: quit ",
     };
 
     let block = Block::default()

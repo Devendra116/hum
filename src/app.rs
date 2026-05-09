@@ -1,6 +1,6 @@
 use crate::player::Player;
 use crate::queue::Queue;
-use crate::types::{AppMode, PlaybackState, PlayerStatus, QueueAction, Track};
+use crate::types::{AppMode, PlaybackState, PlayerStatus, PlaylistHit, QueueAction, Track};
 use anyhow::Result;
 
 pub struct App {
@@ -10,10 +10,12 @@ pub struct App {
     pub mode: AppMode,
     pub search_input: String,
     pub choices: Vec<Track>,
+    pub playlist_choices: Vec<PlaylistHit>,
     pub message: String,
     pub should_quit: bool,
     pub loading: bool,
     pub spinner_tick: u8,
+    pub queue_cursor: Option<usize>,
 }
 
 impl App {
@@ -26,10 +28,14 @@ impl App {
             mode: AppMode::Normal,
             search_input: String::new(),
             choices: Vec::new(),
-            message: String::from("Welcome to hum. Press '/' to search, 'q' to quit."),
+            playlist_choices: Vec::new(),
+            message: String::from(
+                "Welcome to hum. Press '/' to search, paste any YouTube link, or pl:… for playlist search.",
+            ),
             should_quit: false,
             loading: false,
             spinner_tick: 0,
+            queue_cursor: None,
         })
     }
 
@@ -37,6 +43,7 @@ impl App {
     pub fn retreat_queue(&mut self) -> QueueAction {
         if self.queue.prev().is_some() {
             if let Some(track) = self.queue.current().cloned() {
+                self.queue_cursor = self.queue.current_index();
                 self.loading = true;
                 self.status.state = PlaybackState::Loading;
                 self.message = format!("Loading: {} — {}", track.title, track.channel);
@@ -80,6 +87,7 @@ impl App {
 
     pub fn shuffle_queue(&mut self) {
         self.queue.shuffle();
+        self.queue_cursor = self.queue.current_index();
         self.message = "Queue shuffled.".to_string();
     }
 
@@ -97,6 +105,7 @@ impl App {
         self.queue.add(track.clone());
         let idx = self.queue.len() - 1;
         self.queue.set_current(idx);
+        self.queue_cursor = Some(idx);
         match self.player.play_url(url).await {
             Ok(()) => self.message = format!("Playing: {} — {}", track.title, track.channel),
             Err(e) => self.message = format!("Playback error: {e}"),
@@ -108,6 +117,7 @@ impl App {
     pub fn advance_queue(&mut self) -> QueueAction {
         if self.queue.next().is_some() {
             if let Some(track) = self.queue.current().cloned() {
+                self.queue_cursor = self.queue.current_index();
                 self.loading = true;
                 self.status.state = PlaybackState::Loading;
                 self.message = format!("Loading: {} — {}", track.title, track.channel);
@@ -126,6 +136,47 @@ impl App {
         }
         self.message = "Queue ended.".to_string();
         self.status.state = PlaybackState::Stopped;
+        QueueAction::None
+    }
+
+    /// Keep queue cursor valid when queue content changes.
+    pub fn sync_queue_cursor(&mut self) {
+        let len = self.queue.len();
+        self.queue_cursor = match (self.queue_cursor, len) {
+            (_, 0) => None,
+            (Some(i), _) if i < len => Some(i),
+            _ => self.queue.current_index().or(Some(0)),
+        };
+    }
+
+    /// Move queue selection cursor up/down for large playlists.
+    pub fn move_queue_cursor(&mut self, delta: isize) {
+        let len = self.queue.len();
+        if len == 0 {
+            self.queue_cursor = None;
+            return;
+        }
+        let cur = self
+            .queue_cursor
+            .or(self.queue.current_index())
+            .unwrap_or(0) as isize;
+        let next = (cur + delta).clamp(0, (len - 1) as isize) as usize;
+        self.queue_cursor = Some(next);
+    }
+
+    /// Start playing the currently selected queue row.
+    pub fn play_selected(&mut self) -> QueueAction {
+        let Some(idx) = self.queue_cursor.or(self.queue.current_index()) else {
+            return QueueAction::None;
+        };
+        self.queue.set_current(idx);
+        self.queue_cursor = Some(idx);
+        if let Some(track) = self.queue.current().cloned() {
+            self.loading = true;
+            self.status.state = PlaybackState::Loading;
+            self.message = format!("Loading: {} — {}", track.title, track.channel);
+            return QueueAction::FetchUrl(track);
+        }
         QueueAction::None
     }
 }

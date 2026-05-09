@@ -55,6 +55,20 @@ pub enum AppMode {
     Normal,
     Search,
     Choosing,
+    ChoosingPlaylist,
+}
+
+/// A YouTube playlist row from a "Playlists" tab search (for picking in the UI).
+#[derive(Debug, Clone)]
+pub struct PlaylistHit {
+    pub list_id: String,
+    pub title: String,
+}
+
+impl PlaylistHit {
+    pub fn playlist_url(&self) -> String {
+        format!("https://www.youtube.com/playlist?list={}", self.list_id)
+    }
 }
 
 /// Action returned by queue-advance logic — tells the main loop what background

@@ -76,6 +76,12 @@ hum
 
 # Play with radio mode (auto-plays related songs)
 hum --radio midnight city
+
+# Queue a YouTube playlist or mix (watch?v=…&list=… works, including RD… radio mixes)
+hum --playlist "https://www.youtube.com/playlist?list=PLxxxxxxxx"
+
+# Open a single video, podcast episode, Shorts, or Music link (same as pasting in the TUI)
+hum "https://www.youtube.com/watch?v=xxxxxxxxxxx"
 ```
 
 ## Keybindings
@@ -83,7 +89,7 @@ hum --radio midnight city
 
 | Key       | Action                             |
 | --------- | ---------------------------------- |
-| `/`       | Search for a song                  |
+| `/`       | Song title, **paste any YouTube URL** (video, podcast, Shorts, `watch?v=…&list=RD…` mix), `pl:keywords` for playlist search |
 | `Enter`   | Confirm search / play              |
 | `Esc`     | Cancel                             |
 | `Space`   | Play / Pause                       |
@@ -96,8 +102,16 @@ hum --radio midnight city
 | `→`       | Seek forward 10s                   |
 | `←`       | Seek backward 10s                  |
 | `q`       | Quit                               |
-| `1/2/3`   | Pick from choices (when ambiguous) |
+| `1/2/3`   | Pick a song (when search is ambiguous) |
+| `1`–`5`   | Pick a playlist (after a `pl:` search) |
 
+
+## YouTube playlists and links
+
+- **CLI:** `hum --playlist "<url>"` or paste the same URL as the first argument. Accepts normal playlists (`PL…`), **mix / radio lists** (`RD…`, including links like [`watch?v=…&list=RD…&start_radio=1`](https://www.youtube.com/watch?v=AX1zRInC_TA&list=RDEMLbwywICAYOlC2vOj5cPYjQ&start_radio=1)), `watch?v=…&list=…`, or a bare list id.
+- **Single videos:** any `youtube.com`, `youtu.be`, or `music.youtube.com` link without a `list=` parameter is resolved as **one** video (podcasts, live VODs, Shorts, etc.).
+- **In the TUI:** press `/`, paste a URL, or type `pl:chill lofi` to search YouTube’s **Playlists** tab and pick **1–5**. You can also use `pl:https://…` to load a link from playlist mode.
+- Playback still uses **yt-dlp stream URLs + mpv** (not the site player). Keep **yt-dlp updated** (`pip install -U yt-dlp`) if a link format stops working.
 
 ## How It Works
 

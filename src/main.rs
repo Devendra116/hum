@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::io::stdout;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use types::{AppMode, PlaybackState, QueueAction, Track};
+use types::{AppMode, PlaybackState, PlaylistHit, QueueAction, Track};
 
 #[derive(Parser)]
 #[command(name = "hum", version, about = "A minimal, ad-free terminal music player")]
@@ -29,6 +29,10 @@ struct Cli {
     /// Start with radio mode enabled (auto-play related songs)
     #[arg(long)]
     radio: bool,
+
+    /// Load a YouTube playlist URL (or bare list= id) and queue up to 200 tracks
+    #[arg(long, value_name = "URL")]
+    playlist: Option<String>,
 }
 
 /// Results sent back to the main loop from background tasks.
@@ -43,6 +47,12 @@ enum BgResult {
     },
     RadioFetched {
         result: anyhow::Result<Vec<Track>>,
+    },
+    PlaylistLoaded {
+        result: anyhow::Result<Vec<Track>>,
+    },
+    PlaylistSearchDone {
+        result: anyhow::Result<Vec<PlaylistHit>>,
     },
 }
 
@@ -66,9 +76,15 @@ async fn main() -> Result<()> {
 
     let (bg_tx, bg_rx) = mpsc::channel::<BgResult>(16);
 
-    if !cli.query.is_empty() {
+    if let Some(url) = cli.playlist {
+        spawn_youtube_resolve(url, bg_tx.clone(), &mut app);
+    } else if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        spawn_search(query, bg_tx.clone(), &mut app);
+        if youtube::should_resolve_as_youtube_link(&query) {
+            spawn_youtube_resolve(query, bg_tx.clone(), &mut app);
+        } else {
+            spawn_search(query, bg_tx.clone(), &mut app);
+        }
     }
 
     let result = run_loop(&mut terminal, &mut app, bg_tx, bg_rx).await;
@@ -107,6 +123,9 @@ async fn run_loop(
                 match app.mode {
                     AppMode::Search => handle_search_input(app, key.code, &bg_tx),
                     AppMode::Choosing => handle_choice_input(app, key.code, &bg_tx).await,
+                    AppMode::ChoosingPlaylist => {
+                        handle_playlist_choice_input(app, key.code, &bg_tx).await;
+                    }
                     AppMode::Normal => handle_normal_input(app, key.code, &bg_tx).await,
                 }
             }
@@ -176,11 +195,47 @@ async fn handle_bg_result(app: &mut App, msg: BgResult, bg_tx: &mpsc::Sender<BgR
                             "Radio: search only returned songs already in queue.".to_string();
                     } else {
                         app.queue.add_many(fresh);
+                        app.sync_queue_cursor();
                         let action = app.advance_queue();
                         dispatch_action(app, action, bg_tx);
                     }
                 }
                 _ => app.message = "Radio: couldn't find related tracks.".to_string(),
+            }
+        }
+
+        BgResult::PlaylistLoaded { result } => {
+            app.loading = false;
+            match result {
+                Ok(tracks) if !tracks.is_empty() => {
+                    app.queue.clear();
+                    app.queue.add_many(tracks);
+                    app.sync_queue_cursor();
+                    let n = app.queue.len();
+                    app.message = format!("Queued {n} tracks from playlist.");
+                    if let Some(t) = app.queue.current().cloned() {
+                        spawn_url_fetch(t, bg_tx.clone(), app);
+                    }
+                }
+                Ok(_) => {
+                    app.message = "Playlist is empty or could not be read.".to_string();
+                }
+                Err(e) => app.message = format!("Playlist error: {e}"),
+            }
+        }
+
+        BgResult::PlaylistSearchDone { result } => {
+            app.loading = false;
+            match result {
+                Ok(hits) if !hits.is_empty() => {
+                    app.playlist_choices = hits;
+                    app.mode = AppMode::ChoosingPlaylist;
+                    app.message = "Pick a playlist (1–5, Esc to cancel):".to_string();
+                }
+                Ok(_) => {
+                    app.message = "No playlists found for that search.".to_string();
+                }
+                Err(e) => app.message = format!("Playlist search error: {e}"),
             }
         }
     }
@@ -189,6 +244,25 @@ async fn handle_bg_result(app: &mut App, msg: BgResult, bg_tx: &mpsc::Sender<BgR
 // ---------------------------------------------------------------------------
 // Spawn helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve any YouTube URL or bare playlist id (video, mix/RD list, PL playlist, podcast episode, …).
+fn spawn_youtube_resolve(raw: String, tx: mpsc::Sender<BgResult>, app: &mut App) {
+    app.loading = true;
+    app.message = "Resolving YouTube link...".to_string();
+    tokio::spawn(async move {
+        let result = youtube::resolve_any_youtube_input(&raw).await;
+        let _ = tx.send(BgResult::PlaylistLoaded { result }).await;
+    });
+}
+
+fn spawn_playlist_search(query: String, tx: mpsc::Sender<BgResult>, app: &mut App) {
+    app.loading = true;
+    app.message = format!("Searching playlists: {query}...");
+    tokio::spawn(async move {
+        let result = youtube::search_playlists(&query, 5).await;
+        let _ = tx.send(BgResult::PlaylistSearchDone { result }).await;
+    });
+}
 
 fn spawn_search(query: String, tx: mpsc::Sender<BgResult>, app: &mut App) {
     app.loading = true;
@@ -281,10 +355,25 @@ fn handle_search_input(app: &mut App, key: KeyCode, bg_tx: &mpsc::Sender<BgResul
             app.search_input.clear();
         }
         KeyCode::Enter => {
-            let query = app.search_input.clone();
+            let query = app.search_input.trim().to_string();
             app.mode = AppMode::Normal;
             app.search_input.clear();
-            if !query.is_empty() {
+            if query.is_empty() {
+                return;
+            }
+            if let Some(pl_query) = strip_pl_prefix(&query) {
+                let pl_query = pl_query.trim();
+                if pl_query.is_empty() {
+                    return;
+                }
+                if youtube::should_resolve_as_youtube_link(pl_query) {
+                    spawn_youtube_resolve(pl_query.to_string(), bg_tx.clone(), app);
+                } else {
+                    spawn_playlist_search(pl_query.to_string(), bg_tx.clone(), app);
+                }
+            } else if youtube::should_resolve_as_youtube_link(&query) {
+                spawn_youtube_resolve(query, bg_tx.clone(), app);
+            } else {
                 spawn_search(query, bg_tx.clone(), app);
             }
         }
@@ -295,6 +384,44 @@ fn handle_search_input(app: &mut App, key: KeyCode, bg_tx: &mpsc::Sender<BgResul
             app.search_input.push(c);
         }
         _ => {}
+    }
+}
+
+fn strip_pl_prefix(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.len() >= 3 && t[..3].eq_ignore_ascii_case("pl:") {
+        Some(t[3..].trim())
+    } else {
+        None
+    }
+}
+
+async fn handle_playlist_choice_input(
+    app: &mut App,
+    key: KeyCode,
+    bg_tx: &mpsc::Sender<BgResult>,
+) {
+    let pick = match key {
+        KeyCode::Char('1') => Some(0),
+        KeyCode::Char('2') => Some(1),
+        KeyCode::Char('3') => Some(2),
+        KeyCode::Char('4') => Some(3),
+        KeyCode::Char('5') => Some(4),
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.playlist_choices.clear();
+            app.message = "Cancelled.".to_string();
+            return;
+        }
+        _ => return,
+    };
+    if let Some(idx) = pick {
+        if idx < app.playlist_choices.len() {
+            let url = app.playlist_choices[idx].playlist_url();
+            app.playlist_choices.clear();
+            app.mode = AppMode::Normal;
+            spawn_youtube_resolve(url, bg_tx.clone(), app);
+        }
     }
 }
 
@@ -347,6 +474,12 @@ async fn handle_normal_input(
         }
         KeyCode::Char('s') => app.shuffle_queue(),
         KeyCode::Char('r') => app.toggle_radio(),
+        KeyCode::Up => app.move_queue_cursor(-1),
+        KeyCode::Down => app.move_queue_cursor(1),
+        KeyCode::Enter => {
+            let action = app.play_selected();
+            dispatch_action(app, action, bg_tx);
+        }
         KeyCode::Char('+') | KeyCode::Char('=') => app.volume_up().await,
         KeyCode::Char('-') => app.volume_down().await,
         KeyCode::Right => app.seek_forward().await,
