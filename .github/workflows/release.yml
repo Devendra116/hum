@@ -51,7 +51,8 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
+      - name: Build (unix)
+        if: runner.os != 'Windows'
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
@@ -59,6 +60,11 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
         shell: bash
+
+      - name: Build (windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }}
+        shell: pwsh
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
@@ -75,12 +81,12 @@ jobs:
         if: matrix.archive == 'zip'
         run: |
           $staging = "${{ env.BINARY }}-${{ github.ref_name }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $staging
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY }}.exe" "$staging/"
           if (Test-Path "README.md") { Copy-Item "README.md" "$staging/" }
           if (Test-Path "LICENSE")   { Copy-Item "LICENSE" "$staging/" }
           Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip"
-          echo "ASSET=$staging.zip" | Out-File -Append -FilePath $env:GITHUB_ENV
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSET=$staging.zip"
         shell: pwsh
 
       - name: Upload artifact
