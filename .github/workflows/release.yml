@@ -31,12 +31,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -51,8 +45,7 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (unix)
-        if: runner.os != 'Windows'
+      - name: Build
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
@@ -60,11 +53,6 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
         shell: bash
-
-      - name: Build (windows)
-        if: runner.os == 'Windows'
-        run: cargo build --release --target ${{ matrix.target }}
-        shell: pwsh
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
@@ -76,18 +64,6 @@ jobs:
           tar -czf "$STAGING.tar.gz" "$STAGING"
           echo "ASSET=$STAGING.tar.gz" >> "$GITHUB_ENV"
         shell: bash
-
-      - name: Package (windows)
-        if: matrix.archive == 'zip'
-        run: |
-          $staging = "${{ env.BINARY }}-${{ github.ref_name }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY }}.exe" "$staging/"
-          if (Test-Path "README.md") { Copy-Item "README.md" "$staging/" }
-          if (Test-Path "LICENSE")   { Copy-Item "LICENSE" "$staging/" }
-          Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip"
-          Add-Content -Path $env:GITHUB_ENV -Value "ASSET=$staging.zip"
-        shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -107,8 +83,8 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} . \;
-          sha256sum *.tar.gz *.zip > "${{ env.BINARY }}-${{ github.ref_name }}-checksums.txt"
+          find . -type f -name '*.tar.gz' -exec mv {} . \;
+          sha256sum *.tar.gz > "${{ env.BINARY }}-${{ github.ref_name }}-checksums.txt"
           cat "${{ env.BINARY }}-${{ github.ref_name }}-checksums.txt"
 
       - name: Create GitHub Release
@@ -117,5 +93,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
-            artifacts/*.zip
             artifacts/${{ env.BINARY }}-${{ github.ref_name }}-checksums.txt

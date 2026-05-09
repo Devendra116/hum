@@ -24,6 +24,8 @@ function Ok($msg)    { Write-Host "[ ok ]  $msg" -ForegroundColor Green }
 function Warn($msg)  { Write-Host "[warn]  $msg" -ForegroundColor Yellow }
 function Fail($msg)  { Write-Host "[error] $msg" -ForegroundColor Red; exit 1 }
 
+Fail "Windows is not officially supported yet. Current releases only ship Linux/macOS assets. Track progress in the repository issues."
+
 function Verify-Checksum($file, $expected, $label) {
     $actual = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
     if ($actual -ne $expected) {

@@ -1,12 +1,14 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use std::collections::HashMap;
+use std::path::PathBuf;
+#[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -22,6 +24,7 @@ struct IpcRequest {
 }
 
 impl MpvIpc {
+    #[cfg(unix)]
     pub async fn spawn(socket_path: PathBuf) -> Result<Self> {
         let _ = std::fs::remove_file(&socket_path);
 
@@ -58,6 +61,12 @@ impl MpvIpc {
         Ok(Self { tx, _child: child })
     }
 
+    #[cfg(windows)]
+    pub async fn spawn(_socket_path: PathBuf) -> Result<Self> {
+        bail!("Windows build is currently experimental: mpv IPC Unix sockets are not supported yet")
+    }
+
+    #[cfg(unix)]
     async fn io_loop(stream: UnixStream, mut rx: mpsc::Receiver<IpcRequest>) {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();

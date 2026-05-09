@@ -43,12 +43,6 @@ $ hum Big Dawgs
 curl -fsSL https://raw.githubusercontent.com/Devendra116/hum/main/install.sh | sh
 ```
 
-**Windows (PowerShell):**
-
-```powershell
-irm https://raw.githubusercontent.com/Devendra116/hum/main/install.ps1 | iex
-```
-
 The installer handles everything — downloads prebuilt binaries for **hum** and **yt-dlp**, verifies SHA-256 checksums, and installs **mpv** via your system package manager. No Rust or Python required.
 
 To install a specific version:
@@ -60,6 +54,8 @@ curl -fsSL https://raw.githubusercontent.com/Devendra116/hum/main/install.sh | H
 Running the same command again will upgrade to the latest version.
 
 > **Security:** all downloads are over HTTPS from official GitHub repos only, with SHA-256 checksum verification. Binaries install to `~/.local/bin` (no root). You can [inspect the script](install.sh) before running it.
+>
+> **Platform support:** officially supported on Linux and macOS. Windows support is experimental and not shipped in current releases.
 
 ### Other install methods
 
